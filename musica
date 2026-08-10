@@ -1,0 +1,4 @@
+#!/bin/sh
+/home/ashax/.local/bin/yt-dlp -f ba -g "ytsearch1:$*" | head -1 | xargs mplayer -cache 8192
+
+
