@@ -6,19 +6,61 @@
 #   musica algo que quiero escuchar          -> busca y muestra 5 resultados
 #   musica -r algo que quiero escuchar       -> modo radio (autoplay infinito)
 #   musica -l                                -> muestra el historial
+#   DEBUG=1 musica algo que quiero escuchar  -> modo diagnostico completo
 #
 # Dependencias: yt-dlp (con soporte quickjs), mplayer. Opcional: notify-send
 
+VERSION="musica 2.1 (debug)"
 CACHE_DIR="$HOME/.cache/ytplay"
 HIST="$CACHE_DIR/historial.log"
+DEBUG_LOG="$CACHE_DIR/debug.log"
 YTDLP="/home/ashax/.local/bin/yt-dlp"
+QJS="/usr/local/bin/qjs"
 JS='--js-runtimes quickjs'
+DEBUG="${DEBUG:-0}"
+
 mkdir -p "$CACHE_DIR"
 
 TAB="$(printf '\t')"
 RADIO=0
 
-trap 'printf "\nSesion terminada.\n"; exit 0' INT TERM
+# ---- logging ----
+dlog() {
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '[%s] %s\n' "$ts" "$*" >> "$DEBUG_LOG"
+    if [ "$DEBUG" = "1" ]; then
+        printf '[DEBUG] %s\n' "$*" >&2
+    fi
+}
+
+log_session_start() {
+    dlog "=== Nueva sesion ==="
+    dlog "version: $VERSION"
+    dlog "arquitectura: $(uname -m 2>/dev/null)"
+    dlog "kernel: $(uname -r 2>/dev/null)"
+    dlog "PATH: $PATH"
+    dlog "directorio de trabajo: $(pwd)"
+    dlog "CACHE_DIR: $CACHE_DIR"
+}
+
+run_diagnostics() {
+    dlog "--- Diagnostico del sistema ---"
+    dlog "command -v yt-dlp: $(command -v yt-dlp 2>&1)"
+    dlog "yt-dlp ruta configurada: $YTDLP"
+    dlog "yt-dlp --version: $("$YTDLP" --version 2>&1)"
+    dlog "command -v qjs: $(command -v qjs 2>&1)"
+    dlog "qjs ruta configurada: $QJS"
+    dlog "command -v mplayer: $(command -v mplayer 2>&1)"
+    dlog "mplayer -version: $(mplayer -version 2>&1 | head -1)"
+    dlog "uname -a: $(uname -a 2>&1)"
+    dlog "file yt-dlp: $(file "$YTDLP" 2>&1)"
+    dlog "file qjs: $(file "$QJS" 2>&1)"
+}
+
+log_session_start
+[ "$DEBUG" = "1" ] && run_diagnostics
+
+trap 'dlog "Sesion interrumpida por el usuario (INT/TERM)"; printf "\nSesion terminada.\n"; exit 0' INT TERM
 
 # ---- flags ----
 if [ "$1" = "-l" ]; then
@@ -34,50 +76,139 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-# ---- busca video en cache local, o lo descarga ----
+# ---- busca video en cache local, o lo descarga, con diagnostico completo ----
 get_or_download() {
     id="$1"
     cached=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
     if [ -n "$cached" ]; then
+        dlog "Usando archivo en cache: $cached"
         echo "$cached"
-        return
+        return 0
     fi
-    "$YTDLP" $JS -f ba --no-warnings --no-playlist \
-        -o "$CACHE_DIR/${id}.%(ext)s" \
-        "https://www.youtube.com/watch?v=$id" >/dev/null 2>&1
-    find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1
+
+    url="https://www.youtube.com/watch?v=$id"
+    out_tpl="$CACHE_DIR/${id}.%(ext)s"
+    dl_out=$(mktemp)
+    dl_err=$(mktemp)
+
+    dlog "URL de descarga: $url"
+    dlog "Comando de descarga: $YTDLP $JS -f ba --no-warnings --no-playlist -o \"$out_tpl\" \"$url\""
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] Descargando: $url" >&2
+
+    "$YTDLP" $JS -f ba --no-warnings --no-playlist -o "$out_tpl" "$url" > "$dl_out" 2> "$dl_err"
+    dl_rc=$?
+
+    dlog "Codigo de salida yt-dlp (descarga): $dl_rc"
+    dlog "stdout yt-dlp: $(cat "$dl_out")"
+    dlog "stderr yt-dlp: $(cat "$dl_err")"
+
+    if [ "$DEBUG" = "1" ]; then
+        [ -s "$dl_out" ] && { echo "--- stdout yt-dlp ---" >&2; cat "$dl_out" >&2; }
+        [ -s "$dl_err" ] && { echo "--- stderr yt-dlp ---" >&2; cat "$dl_err" >&2; }
+    fi
+
+    file=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
+
+    if [ -n "$file" ]; then
+        size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+        [ -r "$file" ] && legible="si" || legible="no"
+        dlog "Archivo descargado: $file (tamano: ${size:-0} bytes, ext: ${file##*.}, legible: $legible)"
+    else
+        dlog "No se encontro ningun archivo en CACHE_DIR para id=$id tras la descarga."
+    fi
+
+    if [ "$DEBUG" = "1" ]; then
+        dlog "Archivos temporales conservados para depuracion: $dl_out $dl_err"
+    else
+        rm -f "$dl_out" "$dl_err"
+    fi
+
+    if [ -n "$file" ] && [ -s "$file" ] && [ "$dl_rc" -eq 0 ]; then
+        echo "$file"
+        return 0
+    fi
+
+    echo "ERROR: fallo al descargar audio (codigo de salida yt-dlp: $dl_rc)" >&2
+    if [ "$DEBUG" != "1" ] && [ -f "$dl_err" ]; then
+        tail -n 5 "$dl_err" >&2
+    fi
+    echo "Detalle completo en: $DEBUG_LOG" >&2
+    dlog "DESCARGA FALLIDA para id=$id"
+    return 1
 }
 
-# ---- reproduce un id, registra historial y notifica ----
+# ---- reproduce un id: registra historial, notifica, descarga y reproduce ----
 # Siempre reproduce desde archivo local descargado. Nunca entrega una URL
-# temporal de googlevideo.com directamente a mplayer (esas URLs vencen y
-# terminan en HTTP 403).
+# temporal de googlevideo.com directamente a mplayer.
 play_id() {
     id="$1"
     title="$2"
+    dlog "ID seleccionado: $id"
+    dlog "Titulo seleccionado: $title"
     printf "%s\t%s\n" "$(date '+%Y-%m-%d %H:%M')" "$title" >> "$HIST"
     command -v notify-send >/dev/null 2>&1 && notify-send "Reproduciendo" "$title" 2>/dev/null
     echo "-> $title"
 
     file=$(get_or_download "$id")
-    if [ -n "$file" ] && [ -s "$file" ]; then
-        mplayer -nolirc -really-quiet -cache 8192 "$file"
-    else
-        echo "No se pudo descargar el audio, se omite esta pista."
+    dl_status=$?
+
+    if [ "$dl_status" -ne 0 ] || [ -z "$file" ] || [ ! -s "$file" ]; then
+        echo "ERROR: no se pudo obtener un archivo de audio valido para '$title'." >&2
+        echo "Revisa $DEBUG_LOG para el detalle completo. Se omite esta pista." >&2
+        dlog "Reproduccion abortada: archivo invalido o inexistente para id=$id"
+        return 1
     fi
+
+    mp_out=$(mktemp)
+    mp_err=$(mktemp)
+    dlog "Comando mplayer: mplayer -nolirc -really-quiet -cache 8192 \"$file\""
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] Reproduciendo archivo local: $file" >&2
+
+    mplayer -nolirc -really-quiet -cache 8192 "$file" > "$mp_out" 2> "$mp_err"
+    mp_rc=$?
+
+    dlog "Codigo de salida mplayer: $mp_rc"
+    dlog "stdout mplayer: $(cat "$mp_out")"
+    dlog "stderr mplayer: $(cat "$mp_err")"
+
+    if [ "$DEBUG" = "1" ]; then
+        [ -s "$mp_out" ] && cat "$mp_out"
+        [ -s "$mp_err" ] && cat "$mp_err" >&2
+    fi
+    if [ "$mp_rc" -ne 0 ]; then
+        echo "ERROR: mplayer termino con codigo $mp_rc. Ver $DEBUG_LOG" >&2
+    fi
+    rm -f "$mp_out" "$mp_err"
 }
 
 # ---- siguiente track relacionado (mezcla RD de YouTube) para modo radio ----
 next_related() {
     id="$1"
-    "$YTDLP" $JS --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).60s" \
-        "https://www.youtube.com/watch?v=${id}&list=RD${id}" 2>/dev/null | sed -n '2p'
+    rel_err=$(mktemp)
+    result=$("$YTDLP" $JS --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).60s" \
+        "https://www.youtube.com/watch?v=${id}&list=RD${id}" 2> "$rel_err" | sed -n '2p')
+    rel_rc=$?
+    dlog "Comando relacionados (id=$id) codigo salida: $rel_rc"
+    [ -s "$rel_err" ] && dlog "stderr relacionados: $(cat "$rel_err")"
+    rm -f "$rel_err"
+    echo "$result"
 }
 
 # ---- busqueda inicial: 5 resultados numerados ----
+dlog "Termino de busqueda: $*"
 tmpfile=$(mktemp)
+search_err=$(mktemp)
+dlog "Comando de busqueda: $YTDLP $JS --flat-playlist --no-warnings --print \"%(id)s<TAB>%(title).70s\" \"ytsearch5:$*\""
 "$YTDLP" $JS --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).70s" \
-    "ytsearch5:$*" > "$tmpfile" 2>/dev/null
+    "ytsearch5:$*" > "$tmpfile" 2> "$search_err"
+search_rc=$?
+dlog "Codigo de salida busqueda: $search_rc"
+[ -s "$search_err" ] && dlog "stderr busqueda: $(cat "$search_err")"
+if [ "$DEBUG" = "1" ] && [ -s "$search_err" ]; then
+    echo "--- stderr busqueda ---" >&2
+    cat "$search_err" >&2
+fi
+rm -f "$search_err"
 
 n=0
 while IFS="$TAB" read -r id title; do
@@ -90,7 +221,7 @@ done < "$tmpfile"
 rm -f "$tmpfile"
 
 if [ "$n" -eq 0 ]; then
-    echo "Sin resultados."
+    echo "Sin resultados (codigo de salida busqueda: $search_rc). Ver $DEBUG_LOG" >&2
     exit 1
 fi
 
