@@ -10,7 +10,7 @@
 #
 # Dependencias: yt-dlp (con soporte quickjs), mplayer. Opcional: notify-send
 
-VERSION="musica 2.1 (debug)"
+VERSION="musica 2.2 (formato flexible + fallback de clientes)"
 CACHE_DIR="$HOME/.cache/ytplay"
 HIST="$CACHE_DIR/historial.log"
 DEBUG_LOG="$CACHE_DIR/debug.log"
@@ -41,6 +41,14 @@ log_session_start() {
     dlog "PATH: $PATH"
     dlog "directorio de trabajo: $(pwd)"
     dlog "CACHE_DIR: $CACHE_DIR"
+    dlog "yt-dlp ruta: $YTDLP"
+    dlog "yt-dlp version: $("$YTDLP" --version 2>&1)"
+    if [ -x "$QJS" ]; then
+        dlog "QuickJS disponible: si ($QJS)"
+    else
+        dlog "QuickJS disponible: no ($QJS no ejecutable)"
+    fi
+    dlog "mplayer version: $(mplayer -version 2>&1 | head -1)"
 }
 
 run_diagnostics() {
@@ -76,60 +84,84 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-# ---- intenta la descarga con un player_client de YouTube explicito ----
-# YouTube devuelve HTTP 403 en el formato 251 cuando yt-dlp elige por su cuenta
-# el cliente "android_vr". Por eso nunca dejamos que yt-dlp elija solo: probamos
-# una lista fija de clientes explicitos y registramos cual funciono.
+# ---- intenta la descarga con un player_client y un selector de formato dados ----
+# No forzamos formato 251 ni dejamos que yt-dlp elija android_vr por defecto:
+# usamos selector de formato flexible (bestaudio/best) y una lista ordenada de
+# estrategias de player_client, registrando cada intento en debug.log.
 download_with_client() {
     client="$1"
-    id="$2"
+    fmt="$2"
+    id="$3"
     url="https://www.youtube.com/watch?v=$id"
     out_tpl="$CACHE_DIR/${id}.%(ext)s"
     dl_out=$(mktemp)
     dl_err=$(mktemp)
 
-    dlog "Intentando descarga con player_client=$client"
-    dlog "Comando: $YTDLP $JS -f ba --no-warnings --no-playlist --extractor-args \"youtube:player_client=$client\" --print \"%(format_id)s\" -o \"$out_tpl\" \"$url\""
-    [ "$DEBUG" = "1" ] && echo "[DEBUG] Probando player_client=$client" >&2
+    before_files=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | tr '\n' ' ')
+    dlog "Intento: player_client=$client, formato=$fmt"
+    dlog "Archivos en CACHE_DIR antes (id=$id): ${before_files:-ninguno}"
+    dlog "Comando: $YTDLP $JS -f \"$fmt\" --no-warnings --no-playlist --extractor-args \"youtube:player_client=$client\" --print \"%(format_id)s\" -o \"$out_tpl\" \"$url\""
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] Probando player_client=$client formato=$fmt" >&2
 
-    "$YTDLP" $JS -f ba --no-warnings --no-playlist \
+    "$YTDLP" $JS -f "$fmt" --no-warnings --no-playlist \
         --extractor-args "youtube:player_client=$client" \
         --print "%(format_id)s" \
         -o "$out_tpl" "$url" > "$dl_out" 2> "$dl_err"
     dl_rc=$?
     format_id=$(tail -n 1 "$dl_out" 2>/dev/null)
+    after_files=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | tr '\n' ' ')
 
-    dlog "player_client=$client -> codigo salida: $dl_rc, format_id: $format_id"
-    dlog "stdout ($client): $(cat "$dl_out")"
-    dlog "stderr ($client): $(cat "$dl_err")"
+    dlog "player_client=$client formato=$fmt -> codigo salida: $dl_rc, format_id resuelto: $format_id"
+    dlog "stdout: $(cat "$dl_out")"
+    dlog "stderr: $(cat "$dl_err")"
+    dlog "Archivos en CACHE_DIR despues (id=$id): ${after_files:-ninguno}"
 
     if [ "$DEBUG" = "1" ]; then
-        [ -s "$dl_out" ] && { echo "--- stdout ($client) ---" >&2; cat "$dl_out" >&2; }
-        [ -s "$dl_err" ] && { echo "--- stderr ($client) ---" >&2; cat "$dl_err" >&2; }
+        [ -s "$dl_out" ] && { echo "--- stdout ($client/$fmt) ---" >&2; cat "$dl_out" >&2; }
+        [ -s "$dl_err" ] && { echo "--- stderr ($client/$fmt) ---" >&2; cat "$dl_err" >&2; }
     fi
 
     file=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
-
     if [ -n "$file" ]; then
         size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
-        dlog "Archivo tras intento con $client: $file (tamano: ${size:-0} bytes, formato: $format_id)"
+        dlog "Archivo resultante: $file (tamano: ${size:-0} bytes)"
     fi
 
     if [ "$DEBUG" = "1" ]; then
-        dlog "Archivos temporales conservados para depuracion: $dl_out $dl_err"
+        dlog "Temporales conservados: $dl_out $dl_err"
     else
         rm -f "$dl_out" "$dl_err"
     fi
 
     if [ -n "$file" ] && [ -s "$file" ] && [ "$dl_rc" -eq 0 ]; then
-        dlog "EXITO: player_client=$client funciono (formato $format_id)"
+        dlog "EXITO con player_client=$client formato=$fmt (format_id=$format_id)"
         echo "$file"
         return 0
     fi
     return 1
 }
 
-# ---- busca video en cache local, o lo descarga probando clientes explicitos ----
+# ---- inspecciona formatos disponibles cuando todas las estrategias normales fallan ----
+inspect_formats() {
+    id="$1"
+    url="https://www.youtube.com/watch?v=$id"
+    fmt_out=$(mktemp)
+    fmt_err=$(mktemp)
+    dlog "Inspeccionando formatos disponibles (yt-dlp -F) para id=$id"
+    "$YTDLP" $JS --no-warnings --no-playlist -F \
+        --extractor-args "youtube:player_client=default" "$url" > "$fmt_out" 2> "$fmt_err"
+    fmt_rc=$?
+    dlog "yt-dlp -F codigo salida: $fmt_rc"
+    dlog "Formatos disponibles: $(cat "$fmt_out")"
+    [ -s "$fmt_err" ] && dlog "stderr -F: $(cat "$fmt_err")"
+    if [ "$DEBUG" = "1" ]; then
+        echo "--- Formatos disponibles (yt-dlp -F) ---" >&2
+        cat "$fmt_out" >&2
+    fi
+    rm -f "$fmt_out" "$fmt_err"
+}
+
+# ---- busca video en cache local, o lo descarga probando estrategias en orden ----
 get_or_download() {
     id="$1"
     cached=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
@@ -139,18 +171,31 @@ get_or_download() {
         return 0
     fi
 
-    for client in web_embedded web tv; do
-        file=$(download_with_client "$client" "$id")
-        if [ -n "$file" ]; then
-            echo "$file"
-            return 0
-        fi
-        dlog "player_client=$client fallo, probando siguiente cliente"
-    done
+    file=$(download_with_client "default,web_embedded" "bestaudio/best" "$id")
+    if [ -n "$file" ]; then echo "$file"; return 0; fi
+    dlog "Estrategia 1 (default,web_embedded / bestaudio-best) fallo, probando estrategia 2"
 
-    echo "ERROR: fallo al descargar audio con los clientes web_embedded, web y tv." >&2
-    echo "Detalle completo en: $DEBUG_LOG" >&2
-    dlog "DESCARGA FALLIDA para id=$id con todos los player_client probados"
+    file=$(download_with_client "default,-android_vr" "bestaudio/best" "$id")
+    if [ -n "$file" ]; then echo "$file"; return 0; fi
+    dlog "Estrategia 2 (default,-android_vr / bestaudio-best) fallo, probando estrategia 3"
+
+    file=$(download_with_client "web_embedded,default" "bestaudio/best" "$id")
+    if [ -n "$file" ]; then echo "$file"; return 0; fi
+    dlog "Estrategia 3 (web_embedded,default / bestaudio-best) fallo, inspeccionando formatos disponibles"
+
+    inspect_formats "$id"
+
+    dlog "Probando fallback final: player_client=default, formato=best (archivo unico)"
+    file=$(download_with_client "default" "best" "$id")
+    if [ -n "$file" ]; then echo "$file"; return 0; fi
+
+    ytdlp_ver=$("$YTDLP" --version 2>&1)
+    echo "ERROR: no se pudo descargar el audio con ninguna estrategia probada." >&2
+    echo "  (default+web_embedded, default sin android_vr, web_embedded+default, default/best)" >&2
+    echo "yt-dlp instalado: $ytdlp_ver" >&2
+    echo "Puede ser SABR, exigencia de PO token, o un extractor de YouTube desactualizado." >&2
+    echo "Revisa $DEBUG_LOG (incluye la salida completa de 'yt-dlp -F')." >&2
+    dlog "DESCARGA FALLIDA TOTAL para id=$id. yt-dlp version: $ytdlp_ver"
     return 1
 }
 
