@@ -76,45 +76,43 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-# ---- busca video en cache local, o lo descarga, con diagnostico completo ----
-get_or_download() {
-    id="$1"
-    cached=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
-    if [ -n "$cached" ]; then
-        dlog "Usando archivo en cache: $cached"
-        echo "$cached"
-        return 0
-    fi
-
+# ---- intenta la descarga con un player_client de YouTube explicito ----
+# YouTube devuelve HTTP 403 en el formato 251 cuando yt-dlp elige por su cuenta
+# el cliente "android_vr". Por eso nunca dejamos que yt-dlp elija solo: probamos
+# una lista fija de clientes explicitos y registramos cual funciono.
+download_with_client() {
+    client="$1"
+    id="$2"
     url="https://www.youtube.com/watch?v=$id"
     out_tpl="$CACHE_DIR/${id}.%(ext)s"
     dl_out=$(mktemp)
     dl_err=$(mktemp)
 
-    dlog "URL de descarga: $url"
-    dlog "Comando de descarga: $YTDLP $JS -f ba --no-warnings --no-playlist -o \"$out_tpl\" \"$url\""
-    [ "$DEBUG" = "1" ] && echo "[DEBUG] Descargando: $url" >&2
+    dlog "Intentando descarga con player_client=$client"
+    dlog "Comando: $YTDLP $JS -f ba --no-warnings --no-playlist --extractor-args \"youtube:player_client=$client\" --print \"%(format_id)s\" -o \"$out_tpl\" \"$url\""
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] Probando player_client=$client" >&2
 
-    "$YTDLP" $JS -f ba --no-warnings --no-playlist -o "$out_tpl" "$url" > "$dl_out" 2> "$dl_err"
+    "$YTDLP" $JS -f ba --no-warnings --no-playlist \
+        --extractor-args "youtube:player_client=$client" \
+        --print "%(format_id)s" \
+        -o "$out_tpl" "$url" > "$dl_out" 2> "$dl_err"
     dl_rc=$?
+    format_id=$(tail -n 1 "$dl_out" 2>/dev/null)
 
-    dlog "Codigo de salida yt-dlp (descarga): $dl_rc"
-    dlog "stdout yt-dlp: $(cat "$dl_out")"
-    dlog "stderr yt-dlp: $(cat "$dl_err")"
+    dlog "player_client=$client -> codigo salida: $dl_rc, format_id: $format_id"
+    dlog "stdout ($client): $(cat "$dl_out")"
+    dlog "stderr ($client): $(cat "$dl_err")"
 
     if [ "$DEBUG" = "1" ]; then
-        [ -s "$dl_out" ] && { echo "--- stdout yt-dlp ---" >&2; cat "$dl_out" >&2; }
-        [ -s "$dl_err" ] && { echo "--- stderr yt-dlp ---" >&2; cat "$dl_err" >&2; }
+        [ -s "$dl_out" ] && { echo "--- stdout ($client) ---" >&2; cat "$dl_out" >&2; }
+        [ -s "$dl_err" ] && { echo "--- stderr ($client) ---" >&2; cat "$dl_err" >&2; }
     fi
 
     file=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
 
     if [ -n "$file" ]; then
         size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
-        [ -r "$file" ] && legible="si" || legible="no"
-        dlog "Archivo descargado: $file (tamano: ${size:-0} bytes, ext: ${file##*.}, legible: $legible)"
-    else
-        dlog "No se encontro ningun archivo en CACHE_DIR para id=$id tras la descarga."
+        dlog "Archivo tras intento con $client: $file (tamano: ${size:-0} bytes, formato: $format_id)"
     fi
 
     if [ "$DEBUG" = "1" ]; then
@@ -124,16 +122,35 @@ get_or_download() {
     fi
 
     if [ -n "$file" ] && [ -s "$file" ] && [ "$dl_rc" -eq 0 ]; then
+        dlog "EXITO: player_client=$client funciono (formato $format_id)"
         echo "$file"
         return 0
     fi
+    return 1
+}
 
-    echo "ERROR: fallo al descargar audio (codigo de salida yt-dlp: $dl_rc)" >&2
-    if [ "$DEBUG" != "1" ] && [ -f "$dl_err" ]; then
-        tail -n 5 "$dl_err" >&2
+# ---- busca video en cache local, o lo descarga probando clientes explicitos ----
+get_or_download() {
+    id="$1"
+    cached=$(find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1)
+    if [ -n "$cached" ]; then
+        dlog "Usando archivo en cache: $cached"
+        echo "$cached"
+        return 0
     fi
+
+    for client in web_embedded web tv; do
+        file=$(download_with_client "$client" "$id")
+        if [ -n "$file" ]; then
+            echo "$file"
+            return 0
+        fi
+        dlog "player_client=$client fallo, probando siguiente cliente"
+    done
+
+    echo "ERROR: fallo al descargar audio con los clientes web_embedded, web y tv." >&2
     echo "Detalle completo en: $DEBUG_LOG" >&2
-    dlog "DESCARGA FALLIDA para id=$id"
+    dlog "DESCARGA FALLIDA para id=$id con todos los player_client probados"
     return 1
 }
 
