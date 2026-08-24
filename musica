@@ -1,17 +1,18 @@
 #!/bin/sh
-# ytplay - buscar y reproducir audio de YouTube desde la terminal
-# Pensado para antiX 32 bits: solo /bin/sh (dash), sin arrays, sin fzf.
+# musica - buscar y reproducir audio de YouTube desde la terminal
+# antiX 32 bits: /bin/sh (dash), sin arrays, sin fzf.
 #
 # Uso:
-#   ytplay algo que quiero escuchar          -> busca y muestra 5 resultados
-#   ytplay -r algo que quiero escuchar       -> modo radio (autoplay infinito)
-#   ytplay -l                                -> muestra el historial
+#   musica algo que quiero escuchar          -> busca y muestra 5 resultados
+#   musica -r algo que quiero escuchar       -> modo radio (autoplay infinito)
+#   musica -l                                -> muestra el historial
 #
-# Dependencias: yt-dlp, mplayer. Opcional: notify-send
+# Dependencias: yt-dlp (con soporte quickjs), mplayer. Opcional: notify-send
 
 CACHE_DIR="$HOME/.cache/ytplay"
 HIST="$CACHE_DIR/historial.log"
 YTDLP="/home/ashax/.local/bin/yt-dlp"
+JS='--js-runtimes quickjs'
 mkdir -p "$CACHE_DIR"
 
 TAB="$(printf '\t')"
@@ -29,7 +30,7 @@ if [ "$1" = "-r" ]; then
     shift
 fi
 if [ $# -eq 0 ]; then
-    echo "Uso: ytplay [-r] termino de busqueda   |   ytplay -l (historial)"
+    echo "Uso: musica [-r] termino de busqueda   |   musica -l (historial)"
     exit 1
 fi
 
@@ -41,13 +42,16 @@ get_or_download() {
         echo "$cached"
         return
     fi
-    "$YTDLP" -f ba --no-warnings --no-playlist \
+    "$YTDLP" $JS -f ba --no-warnings --no-playlist \
         -o "$CACHE_DIR/${id}.%(ext)s" \
         "https://www.youtube.com/watch?v=$id" >/dev/null 2>&1
     find "$CACHE_DIR" -maxdepth 1 -name "${id}.*" 2>/dev/null | head -1
 }
 
 # ---- reproduce un id, registra historial y notifica ----
+# Siempre reproduce desde archivo local descargado. Nunca entrega una URL
+# temporal de googlevideo.com directamente a mplayer (esas URLs vencen y
+# terminan en HTTP 403).
 play_id() {
     id="$1"
     title="$2"
@@ -57,23 +61,22 @@ play_id() {
 
     file=$(get_or_download "$id")
     if [ -n "$file" ] && [ -s "$file" ]; then
-        mplayer -really-quiet -cache 8192 "$file"
+        mplayer -nolirc -really-quiet -cache 8192 "$file"
     else
-        url=$("$YTDLP" -f ba -g --no-warnings --no-playlist "https://www.youtube.com/watch?v=$id")
-        [ -n "$url" ] && mplayer -really-quiet -cache 8192 "$url"
+        echo "No se pudo descargar el audio, se omite esta pista."
     fi
 }
 
 # ---- siguiente track relacionado (mezcla RD de YouTube) para modo radio ----
 next_related() {
     id="$1"
-    "$YTDLP" --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).60s" \
+    "$YTDLP" $JS --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).60s" \
         "https://www.youtube.com/watch?v=${id}&list=RD${id}" 2>/dev/null | sed -n '2p'
 }
 
 # ---- busqueda inicial: 5 resultados numerados ----
 tmpfile=$(mktemp)
-"$YTDLP" --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).70s" \
+"$YTDLP" $JS --flat-playlist --no-warnings --print "%(id)s${TAB}%(title).70s" \
     "ytsearch5:$*" > "$tmpfile" 2>/dev/null
 
 n=0
